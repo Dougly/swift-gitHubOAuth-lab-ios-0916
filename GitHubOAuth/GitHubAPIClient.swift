@@ -17,10 +17,13 @@ enum GitHubRequestType {
     case repositories
     case star(repo: Repository)
     case unStar(repo: Repository)
+    case oauth
+    case token(url: URL)
 
     private enum BaseURL {
         
         static let api = "https://api.github.com"
+        static let standard = "https://github.com"
         
     }
     
@@ -28,6 +31,8 @@ enum GitHubRequestType {
         
         static let repositories = "/repositories"
         static func starred(repo: Repository) -> String { return "/user/starred/\(repo.fullName)" }
+        static let oauth = "/login/oauth/authorize"
+        static let token = "/login/oauth/access_token"
         
     }
     
@@ -35,13 +40,19 @@ enum GitHubRequestType {
         
         static let repositories = "?client_id=\(Secrets.clientID)&client_secret=\(Secrets.clientSecret)"
         static func starred(token: String) -> String {
-            return "?client_id=\(Secrets.clientID)&client_secret=\(Secrets.clientSecret)&access_token="
+            return "?client_id=\(Secrets.clientID)&client_secret=\(Secrets.clientSecret)&access_token=" + token
         }
+        static let ouath = "?client_id=\(Secrets.clientID)&scope=repo"
     }
     
     fileprivate func buildParams(with code: String) -> [String: String]? {
-    
-        return nil
+        
+        switch self {
+        case .token:
+            return ["client_id" : Secrets.clientID, "client_secret": Secrets.clientSecret, "code": code]
+        default:
+            return nil
+        }
         
     }
     
@@ -54,6 +65,10 @@ enum GitHubRequestType {
             return "PUT"
         case .unStar:
             return "DELETE"
+        case .oauth:
+            return nil
+        case .token:
+            return "POST"
         }
         
     }
@@ -62,9 +77,14 @@ enum GitHubRequestType {
         
         switch self {
         case .checkStar(repo: let repo), .star(repo: let repo), .unStar(repo: let repo):
+            print("\(BaseURL.api + Path.starred(repo: repo) + Query.starred(token: GitHubAPIClient.accessToken))")
             return URL(string: BaseURL.api + Path.starred(repo: repo) + Query.starred(token: GitHubAPIClient.accessToken))!
         case .repositories:
             return URL(string: BaseURL.api + Path.repositories + Query.repositories)!
+        case .oauth:
+            return URL(string: BaseURL.standard + Path.oauth + Query.ouath)!
+        case .token:
+            return URL(string: BaseURL.standard + Path.token)!
         }
         
     }
@@ -113,9 +133,31 @@ struct GitHubAPIClient {
             var request = URLRequest(url: type.url)
             request.httpMethod = type.method!
             return request
+        
+        case .token(url: let url):
+            let code = url.getQueryItemValue(named: "code")
+            if let code = code {
+                let parameters = type.buildParams(with: code)
+                var request = URLRequest(url: type.url)
+                request.httpMethod = type.method!
+                request.addValue("application/json", forHTTPHeaderField: "Accept")
+                request.addValue("application/json", forHTTPHeaderField: "Content-Type")
+                
+                do {
+                    request.httpBody = try JSONSerialization.data(withJSONObject: parameters!, options: [])
+                } catch {
+                    print("JSON serialization of parameters dictionary failed")
+                    return nil
+                }
+                
+                return request
+                
+            }
+            print("code was not unwrapped")
+            return nil
             
-//        default:
-//            return nil
+        default:
+            return nil
         }
         
     }
@@ -141,8 +183,10 @@ struct GitHubAPIClient {
                 (json, starred, error) = processRepositories(response: response)
             case .star, .unStar:
                 (json, starred, error) = processStarred(response: response)
-//            default:
-//                (json, starred, error) = (nil, nil, GitHubError.response)
+            case .token:
+                (json, starred, error) = processToken(response: response)
+            default:
+                (json, starred, error) = (nil, nil, GitHubError.response)
             
             }
             completionHandler(json, starred, error)
@@ -169,7 +213,7 @@ struct GitHubAPIClient {
     }
     
     private static func processStarCheck(response: (Data?, URLResponse?, Error?)) -> Response {
-        
+         
         let (_, urlResponse, error) = response
         if error != nil { return (nil, nil, error) }
         let httpResponse = urlResponse as! HTTPURLResponse
@@ -201,7 +245,27 @@ struct GitHubAPIClient {
     }
     
     private static func processToken(response: (Data?, URLResponse?, Error?)) -> Response {
+        
+        let (data, _, error) = response
+        if error != nil { return (nil, nil, error) }
+        
+        if let data = data {
+            do {
+                let recievedData = try JSONSerialization.jsonObject(with: data, options: []) as! [String:Any]
+                let accessToken = recievedData["access_token"] as! String
+                let saveError = saveAccess(token: accessToken)
+                if saveError != nil {
+                    print("got error: \(saveError)")
+                    return (nil, nil, saveError)
+                }
 
+            } catch {
+                print("process token JSON serialization failed")
+            }
+            
+            
+        }
+        
         return (nil, nil, nil)
         
     }
@@ -236,6 +300,12 @@ struct GitHubAPIClient {
     
     static func deleteAccessToken() -> Error?  {
         
+        
+        do {
+            try Locksmith.deleteDataForUserAccount(userAccount: "github")
+        } catch let error {
+            return error
+        }
         return nil
 
     }
